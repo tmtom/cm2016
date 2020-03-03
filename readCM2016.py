@@ -1,10 +1,13 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 
 import struct
 import serial
 
-SERIAL = "/dev/cu.SLAB_USBtoUART"
+from influxdb import InfluxDBClient
+from datetime import datetime
+
+SERIAL = "/dev/ttyUSB0"
  
 # Open serial device for reading, it is 19200 baud, 8N1
 ser = serial.Serial(SERIAL, 19200)
@@ -60,6 +63,8 @@ def slotStr(slot):
     else:
         return str(slot)
 
+
+client = InfluxDBClient(database='cm2016')
 while True:
     # make sure that are no old bytes left in the input buffer
     ser.reset_input_buffer()
@@ -73,14 +78,76 @@ while True:
 
     # the next 10 bytes are global data for all slots or the device
     header = ser.read(10)
-    print 'VERSION=%d.%d CHEM=%s OVERTEMP_FLAG=%d TEMP_START=%d TEMP_ACT=%d ACTION_CNTR=%d' % ( ord(header[0]),ord(header[1]),CHEM[ord(header[2])],ord(header[3]),struct.unpack(">h", header[4:6])[0],struct.unpack(">h", header[6:8])[0],struct.unpack(">h", header[8:10])[0])
+    print('VERSION=%d.%d CHEM=%s OVERTEMP_FLAG=%d TEMP_START=%d TEMP_ACT=%d ACTION_CNTR=%d' % ( ord(header[0]),ord(header[1]),CHEM[ord(header[2])],ord(header[3]),struct.unpack(">h", header[4:6])[0],struct.unpack(">h", header[6:8])[0],struct.unpack(">h", header[8:10])[0]))
+
+    timestamp = datetime.utcnow().isoformat()
 
     # the CM2016 has 6 slots, each is 18 bytes of data
+    json_data = []
     for slot in range(1,7):
         slotData = ser.read(18)
-        print 'Slot S%s : %s/%s/%s/?%d? Time=%s Voltage=%.3fV Current=%.3fA CCAP=%.3fmAh DCAP=%.3fmAh' % (slotStr(slot),ACTIVE[ord(slotData[0])],PROGRAM[ord(slotData[1])],MODES[ord(slotData[2])],ord(slotData[3]),timeStr(struct.unpack("<h", slotData[4:6])[0]),struct.unpack("<h", slotData[6:8])[0] / 1000.0,struct.unpack("<h", slotData[8:10])[0] / 1000.0,struct.unpack("<i", slotData[10:14])[0] / 100.0,struct.unpack("<i", slotData[14:18])[0] / 100.0)
+
+        active = ord(slotData[0]) == 1
+        program = PROGRAM[ord(slotData[1])]
+        mode = MODES[ord(slotData[2])]
+        status = "unknown"
+        status_byte = ord(slotData[3])
+        if status_byte == 0x20:
+            status = "empty"
+        if active:
+            if status_byte == 0x07:
+                status = "TRI"
+        else:
+            if status_byte == 0x21:
+                status = "ERR"
+            elif status_byte == 0x07 or status_byte==0x02:
+                status = "RDY"
+
+        duration = timeStr(struct.unpack("<h", slotData[4:6])[0])
+        voltage = struct.unpack("<h", slotData[6:8])[0] / 1000.0
+        current = struct.unpack("<h", slotData[8:10])[0] / 1000.0
+        ccap = struct.unpack("<i", slotData[10:14])[0] / 100.0
+        dcap = struct.unpack("<i", slotData[14:18])[0] / 100.0
+
+        # print(active, program, mode, status)
+        print('Slot S%s : %s/%s/%s/%s Time=%s Voltage=%.3fV Current=%.3fA CCAP=%.3fmAh DCAP=%.3fmAh' % (slotStr(slot),
+                                                                                                          ACTIVE[ord(slotData[0])],
+                                                                                                          program,
+                                                                                                          mode,
+                                                                                                          status,
+                                                                                                          duration,
+                                                                                                          voltage,
+                                                                                                          current,
+                                                                                                          ccap,
+                                                                                                          dcap))
+        data = {
+            "measurement": "CM2016",
+            "time": timestamp,
+            "tags": {
+                "slot": "S" + slotStr(slot)
+            },
+            "fields": {
+                "active": active,
+                "program": program,
+                "mode": mode,
+                "status": status,
+                "time": duration,
+                "voltage": voltage,
+                "current": current,
+                "ccap": ccap,
+                "dcap": dcap
+            }
+        }
+        json_data.append(data)
+
+    # as it may take longer to write the datapoints we should probably read CM2016 and in parallel bundle and send data to InfluxDB
+    if not client.write_points(json_data):
+        print("Influx problem")
+
 
     # and a 16 byte CRC follows
     crc = ser.read(2)
     # the way the CRC16 is calculated is unknown to me, it either is a very uncommon one or it is initialized in a different way. The Visual Basic software from Conrad doesn't check for it, it only tests the header
-    print
+
+    # client.write_points(json_body)
+    print("")
